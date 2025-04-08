@@ -1,0 +1,13 @@
+This directory contains the database migration scripts for the Amusement Park People Counting System.
+
+The migrations are managed using Alembic, a database migration tool for SQLAlchemy.
+
+To create a new migration:
+1. Make changes to your models in app/models.py
+2. Run: `alembic revision --autogenerate -m "description of changes"`
+3. Review the generated migration file
+4. Apply the migration: `alembic upgrade head`
+
+To rollback a migration:
+- Run: `alembic downgrade -1` (rolls back one migration)
+- Or: `alembic downgrade <revision>` (rolls back to specific revision) 
