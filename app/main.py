@@ -383,7 +383,7 @@ async def trigger_device(device_id: int, db: Session = Depends(get_db)):
         )
 
 # Report endpoints
-@app.get("/reports/", response_model=List[schemas.DeviceReport])
+@app.get("/reports/", response_model=List[schemas.Report])
 async def list_reports(
     device_id: Optional[int] = None,
     start_date: Optional[datetime] = None,
@@ -393,14 +393,14 @@ async def list_reports(
     db: Session = Depends(get_db)
 ):
     try:
-        query = db.query(models.DeviceReport)
+        query = db.query(models.Report)
         if device_id:
-            query = query.filter(models.DeviceReport.device_id == device_id)
+            query = query.filter(models.Report.device_id == device_id)
         if start_date:
-            query = query.filter(models.DeviceReport.created_at >= start_date)
+            query = query.filter(models.Report.created_at >= start_date)
         if end_date:
-            query = query.filter(models.DeviceReport.created_at <= end_date)
-        reports = query.order_by(models.DeviceReport.created_at.desc()).offset(skip).limit(limit).all()
+            query = query.filter(models.Report.created_at <= end_date)
+        reports = query.order_by(models.Report.created_at.desc()).offset(skip).limit(limit).all()
         return reports
     except Exception as e:
         logger.error(f"Error listing reports: {str(e)}")
