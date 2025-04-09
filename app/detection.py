@@ -179,114 +179,130 @@ class DetectionSystem:
 
     def _process_camera_stream(self, camera: models.Camera, camera_type: str, device_id: int, db: Session):
         """Process camera stream and update tracking data."""
-        try:
-            # Initialize video capture
-            cap = cv2.VideoCapture(camera.rtsp_url)
-            if not cap.isOpened():
-                logger.error(f"Failed to open RTSP stream for camera {camera.id}")
-                return
-
+        max_retries = 5
+        retry_count = 0
+        retry_delay = 3  # seconds
+        
+        while self.tracking_data[device_id]["is_running"] and retry_count < max_retries:
             try:
-                # Set buffer size to 1 to get the latest frame
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                cap = cv2.VideoCapture(camera.rtsp_url)
+                if not cap.isOpened():
+                    logger.error(f"Failed to open RTSP stream for camera {camera.id}")
+                    retry_count += 1
+                    time.sleep(retry_delay)
+                    continue
 
-                while self.tracking_data[device_id]["is_running"]:
-                    # Skip frames to get to the latest one
-                    for _ in range(5):
-                        cap.grab()
-                    
-                    # Read the latest frame
-                    ret, frame = cap.read()
-                    if not ret:
-                        logger.error(f"Failed to read frame from camera {camera.id}")
-                        continue
+                logger.info(f"Successfully connected to camera {camera.id}")
+                retry_count = 0  # Reset retry counter on success
 
-                    # Process the frame with YOLO
-                    results = self.model(frame)
-                    
-                    # Filter detections to only include people (class 0)
-                    detections = []
-                    for result in results:
-                        boxes = result.boxes
-                        for box in boxes:
-                            if box.cls[0] == 0:  # Class 0 is person
-                                # Get box coordinates and confidence
-                                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                                conf = box.conf[0].item()  # Convert tensor to Python float
-                                width = x2 - x1
-                                height = y2 - y1
-                                # Format detection as [left, top, right, bottom, confidence]
-                                # detections.append([x1, y1, x2, y2, conf])
-                                detections.append(([x1, y1, width, height], conf))
+                try:
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    last_process_time = time.time()
 
-                    # Update DeepSORT tracker
-                    if len(detections) > 0:
-                        # Convert to list of tuples with native Python floats
-                        detections_list = [
-                            (
-                                [float(det[0][0]), # x1
-                                float(det[0][1]),  # y1
-                                float(det[0][2]),  # x2
-                                float(det[0][3])   # y2
-                                ],
-                                 float(det[1])
-                            ) for det in detections
-                        ]
+                    while self.tracking_data[device_id]["is_running"]:
+                        # Maintain processing rate
+                        if time.time() - last_process_time < 0.1:  # 10 FPS
+                            continue
+                        last_process_time = time.time()
+
+                        # Skip frames
+                        for _ in range(5):
+                            cap.grab()
+
+                        # Read frame
+                        ret, frame = cap.read()
+                        if not ret or frame is None or frame.size == 0:
+                            logger.warning(f"Invalid frame from camera {camera.id}")
+                            continue
+
+                        # YOLO processing
+                        results = self.model(frame)
                         
-                        tracks = self.tracker.update_tracks(detections_list, frame=frame)
-                    else:
-                        tracks = []
+                        # Detection processing
+                        detections = []
+                        for result in results:
+                            boxes = result.boxes
+                            for box in boxes:
+                                if box.cls[0] == 0:  # Person class
+                                    try:
+                                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                                        conf = box.conf[0].item()
+                                        width = x2 - x1
+                                        height = y2 - y1
+                                        
+                                        # Validate coordinates
+                                        if all(coord >= 0 for coord in [x1, y1, width, height]):
+                                            detections.append(([x1, y1, width, height], conf))
+                                    except Exception as e:
+                                        logger.error(f"Error processing box: {str(e)}")
 
-                    # Process tracks and update counting
-                    current_time = datetime.now()
-                    with self.tracking_lock:
-                        # Get the tracks dictionary for this camera type
-                        tracks_dict = self.tracking_data[device_id][f"{camera_type}_tracks"]
-                        
-                        # Update existing tracks and check for new entries/exits
-                        active_tracks = set()
-                        for track in tracks:
-                            if not track.is_confirmed():
-                                continue
-                                
-                            track_id = track.track_id
-                            active_tracks.add(track_id)
+                        # Update tracker
+                        if detections:
+                            detections_list = [
+                                (
+                                    [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])],
+                                    float(conf)
+                                ) for (bbox, conf) in detections
+                            ]
+                            tracks = self.tracker.update_tracks(detections_list, frame=frame)
+                        else:
+                            tracks = []
+
+                        # Process tracks and update counting
+                        current_time = datetime.now()
+                        with self.tracking_lock:
+                            # Get the tracks dictionary for this camera type
+                            tracks_dict = self.tracking_data[device_id][f"{camera_type}_tracks"]
                             
-                            if track_id not in tracks_dict:
-                                # New track detected
-                                tracks_dict[track_id] = current_time
-                                if camera_type == "entry":
-                                    self.tracking_data[device_id]["current_count"] += 1
-                            else:
-                                # Existing track, update last seen time
-                                tracks_dict[track_id] = current_time
-                        
-                        # Check for tracks that are no longer active
-                        for track_id in list(tracks_dict.keys()):
-                            if track_id not in active_tracks:
-                                # Track is no longer visible
-                                last_seen = tracks_dict[track_id]
-                                time_since_last_seen = (current_time - last_seen).total_seconds()
+                            # Update existing tracks and check for new entries/exits
+                            active_tracks = set()
+                            for track in tracks:
+                                if not track.is_confirmed():
+                                    continue
+                                    
+                                track_id = track.track_id
+                                active_tracks.add(track_id)
                                 
-                                if time_since_last_seen > self.tracking_data[device_id]["cooldown_period"]:
-                                    # Remove track after cooldown period
-                                    del tracks_dict[track_id]
-                                    if camera_type == "exit":
-                                        self.tracking_data[device_id]["current_count"] -= 1
+                                if track_id not in tracks_dict:
+                                    # New track detected
+                                    tracks_dict[track_id] = current_time
+                                    if camera_type == "entry":
+                                        self.tracking_data[device_id]["current_count"] += 1
+                                else:
+                                    # Existing track, update last seen time
+                                    tracks_dict[track_id] = current_time
+                            
+                            # Check for tracks that are no longer active
+                            for track_id in list(tracks_dict.keys()):
+                                if track_id not in active_tracks:
+                                    # Track is no longer visible
+                                    last_seen = tracks_dict[track_id]
+                                    time_since_last_seen = (current_time - last_seen).total_seconds()
+                                    
+                                    if time_since_last_seen > self.tracking_data[device_id]["cooldown_period"]:
+                                        # Remove track after cooldown period
+                                        del tracks_dict[track_id]
+                                        if camera_type == "exit":
+                                            self.tracking_data[device_id]["current_count"] -= 1
 
-                        # Create report if enough time has passed
-                        if (current_time - self.tracking_data[device_id]["last_report_time"]).total_seconds() >= 60:
-                            self._create_camera_report(device_id, db)
-                            self.tracking_data[device_id]["last_report_time"] = current_time
+                            # Create report if enough time has passed
+                            if (current_time - self.tracking_data[device_id]["last_report_time"]).total_seconds() >= 60:
+                                self._create_camera_report(device_id, db)
+                                self.tracking_data[device_id]["last_report_time"] = current_time
 
-                    # Small delay to prevent CPU overload
-                    time.sleep(0.1)
+                except Exception as e:
+                    logger.error(f"Processing error for camera {camera.id}: {str(e)}")
+                finally:
+                    cap.release()
+                    time.sleep(1)
 
-            finally:
-                cap.release()
+            except Exception as e:
+                logger.error(f"Connection error for camera {camera.id}: {str(e)}")
+                retry_count += 1
+                time.sleep(retry_delay)
 
-        except Exception as e:
-            logger.error(f"Error processing camera stream: {str(e)}")
+        if retry_count >= max_retries:
+            logger.error(f"Max retries ({max_retries}) reached for camera {camera.id}")
 
     def _create_camera_report(self, device_id: int, db: Session):
         """Create a report for camera-based detection."""
