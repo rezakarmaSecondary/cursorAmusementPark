@@ -49,3 +49,5 @@ uvicorn app.main:app --reload
 ## API Documentation
 
 Once the server is running, visit `/docs` for the Swagger UI documentation. 
+
+ffmpeg -stream_loop -1 -i input.mp4 -c:v libx264 -f rtsp rtsp://localhost:8554/mystream

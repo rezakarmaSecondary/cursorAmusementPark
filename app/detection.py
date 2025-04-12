@@ -67,8 +67,12 @@ class DetectionSystem:
             processed_images = []
 
             for camera in cameras:
-                # Initialize video capture
-                cap = cv2.VideoCapture(camera.rtsp_url)
+                # Initialize video capture with FFMPEG backend
+                rtsp_url = camera.rtsp_url
+                if not rtsp_url.startswith('rtsp'):
+                    rtsp_url += '?tcp'  # Add TCP transport if needed
+                
+                cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
                 if not cap.isOpened():
                     logger.error(f"Failed to open RTSP stream for camera {camera.id}")
                     continue
@@ -78,13 +82,13 @@ class DetectionSystem:
                     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     
                     # Skip frames to get to the latest one
-                    for _ in range(10):  # Skip more frames to ensure we get a fresh one
+                    for _ in range(10):
                         cap.grab()
                     
                     # Read the latest frame
                     ret, frame = cap.read()
-                    if not ret:
-                        logger.error(f"Failed to read frame from camera {camera.id}")
+                    if not ret or frame is None or frame.size == 0:
+                        logger.error(f"Failed to read valid frame from camera {camera.id}")
                         continue
 
                     # Process the frame with YOLO and save the result
@@ -96,22 +100,21 @@ class DetectionSystem:
                     results = self.model(frame, save=True, project=str(self.image_save_path), name=image_filename)
                     
                     # Get the number of people detected
-                    people_count = len(results[0].boxes)
+                    if results and len(results[0].boxes) > 0:
+                        people_count = len(results[0].boxes)
+                    else:
+                        people_count = 0
+                        
                     total_people += people_count
                     
                     # Add the saved image path to the list
                     processed_images.append(str(image_path))
                     
-                    # Log frame capture details
                     logger.info(f"Captured frame for camera {camera.id} at {timestamp} with {people_count} people detected")
 
                 finally:
-                    # Always release the capture
+                    # Release resources
                     cap.release()
-                    # Force garbage collection
-                    import gc
-                    gc.collect()
-                    # Add a small delay before processing next camera
                     time.sleep(0.5)
 
             return {
@@ -126,12 +129,10 @@ class DetectionSystem:
     def start_camera_based_detection(self, device_id: int, db: Session):
         """Start continuous camera-based detection for a device."""
         try:
-            # Get device and its cameras
             device = db.query(models.Device).filter(models.Device.id == device_id).first()
             if not device:
                 raise ValueError(f"Device with ID {device_id} not found")
 
-            # Get entry and exit cameras
             entry_camera = db.query(models.Camera).filter(
                 models.Camera.device_id == device_id,
                 models.Camera.camera_type == "entry"
@@ -145,17 +146,15 @@ class DetectionSystem:
             if not entry_camera or not exit_camera:
                 raise ValueError("Both entry and exit cameras must be configured for camera-based detection")
 
-            # Initialize tracking data for this device
             self.tracking_data[device_id] = {
-                "entry_tracks": {},  # track_id -> last_seen_time
-                "exit_tracks": {},   # track_id -> last_seen_time
+                "entry_tracks": {},
+                "exit_tracks": {},
                 "current_count": 0,
                 "last_report_time": datetime.now(),
                 "is_running": True,
-                "cooldown_period": 600  # 10 minutes in seconds
+                "cooldown_period": 600
             }
 
-            # Start detection threads for both cameras
             self.detection_threads[device_id] = {
                 "entry": threading.Thread(
                     target=self._process_camera_stream,
@@ -167,7 +166,6 @@ class DetectionSystem:
                 )
             }
 
-            # Start both threads
             self.detection_threads[device_id]["entry"].start()
             self.detection_threads[device_id]["exit"].start()
 
@@ -178,150 +176,132 @@ class DetectionSystem:
             raise
 
     def _process_camera_stream(self, camera: models.Camera, camera_type: str, device_id: int, db: Session):
-        """Process camera stream and update tracking data."""
+        """Process camera stream with reconnection logic."""
         max_retries = 5
-        retry_count = 0
-        retry_delay = 3  # seconds
+        reconnect_attempts = 0
+        max_reconnect_attempts = 3
+        error_count = 0
+        max_errors_before_reconnect = 10
         
-        while self.tracking_data[device_id]["is_running"] and retry_count < max_retries:
+        rtsp_url = camera.rtsp_url
+        if not rtsp_url.startswith('rtsp'):
+            rtsp_url += '?tcp'
+
+        while self.tracking_data.get(device_id, {}).get("is_running", False) and reconnect_attempts < max_reconnect_attempts:
+            cap = None
             try:
-                cap = cv2.VideoCapture(camera.rtsp_url)
+                cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
                 if not cap.isOpened():
                     logger.error(f"Failed to open RTSP stream for camera {camera.id}")
-                    retry_count += 1
-                    time.sleep(retry_delay)
+                    reconnect_attempts += 1
+                    time.sleep(2)
                     continue
 
                 logger.info(f"Successfully connected to camera {camera.id}")
-                retry_count = 0  # Reset retry counter on success
+                reconnect_attempts = 0
+                error_count = 0
 
-                try:
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    last_process_time = time.time()
+                while self.tracking_data[device_id]["is_running"]:
+                    # Skip frames to get the latest one
+                    for _ in range(5):
+                        cap.grab()
 
-                    while self.tracking_data[device_id]["is_running"]:
-                        # Maintain processing rate
-                        if time.time() - last_process_time < 0.1:  # 10 FPS
-                            continue
-                        last_process_time = time.time()
+                    ret, frame = cap.read()
+                    if not ret or frame is None or frame.size == 0:
+                        error_count += 1
+                        if error_count >= max_errors_before_reconnect:
+                            logger.error("Too many consecutive errors, reconnecting...")
+                            break
+                        continue
+                    
+                    error_count = 0  # Reset error counter
 
-                        # Skip frames
-                        for _ in range(5):
-                            cap.grab()
+                    # Process frame
+                    results = self.model(frame)
+                    
+                    # Filter detections
+                    detections = []
+                    for result in results:
+                        boxes = result.boxes
+                        for box in boxes:
+                            if box.cls[0] == 0:
+                                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                                conf = box.conf[0].item()
+                                width = x2 - x1
+                                height = y2 - y1
+                                detections.append(([x1, y1, width, height], conf))
 
-                        # Read frame
-                        ret, frame = cap.read()
-                        if not ret or frame is None or frame.size == 0:
-                            logger.warning(f"Invalid frame from camera {camera.id}")
-                            continue
+                    # Update tracker
+                    if detections:
+                        detections_list = [
+                            (
+                                [float(det[0][0]), float(det[0][1]),
+                                 float(det[0][2]), float(det[0][3])],
+                                float(det[1])
+                            ) for det in detections
+                        ]
+                        tracks = self.tracker.update_tracks(detections_list, frame=frame)
+                    else:
+                        tracks = []
 
-                        # YOLO processing
-                        results = self.model(frame)
+                    # Update tracking data
+                    current_time = datetime.now()
+                    with self.tracking_lock:
+                        tracks_dict = self.tracking_data[device_id][f"{camera_type}_tracks"]
+                        active_tracks = set()
                         
-                        # Detection processing
-                        detections = []
-                        for result in results:
-                            boxes = result.boxes
-                            for box in boxes:
-                                if box.cls[0] == 0:  # Person class
-                                    try:
-                                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                                        conf = box.conf[0].item()
-                                        width = x2 - x1
-                                        height = y2 - y1
-                                        
-                                        # Validate coordinates
-                                        if all(coord >= 0 for coord in [x1, y1, width, height]):
-                                            detections.append(([x1, y1, width, height], conf))
-                                    except Exception as e:
-                                        logger.error(f"Error processing box: {str(e)}")
-
-                        # Update tracker
-                        if detections:
-                            detections_list = [
-                                (
-                                    [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])],
-                                    float(conf)
-                                ) for (bbox, conf) in detections
-                            ]
-                            tracks = self.tracker.update_tracks(detections_list, frame=frame)
-                        else:
-                            tracks = []
-
-                        # Process tracks and update counting
-                        current_time = datetime.now()
-                        with self.tracking_lock:
-                            # Get the tracks dictionary for this camera type
-                            tracks_dict = self.tracking_data[device_id][f"{camera_type}_tracks"]
-                            
-                            # Update existing tracks and check for new entries/exits
-                            active_tracks = set()
-                            for track in tracks:
-                                if not track.is_confirmed():
-                                    continue
-                                    
-                                track_id = track.track_id
-                                active_tracks.add(track_id)
+                        for track in tracks:
+                            if not track.is_confirmed():
+                                continue
                                 
-                                if track_id not in tracks_dict:
-                                    # New track detected
-                                    tracks_dict[track_id] = current_time
-                                    if camera_type == "entry":
-                                        self.tracking_data[device_id]["current_count"] += 1
-                                else:
-                                    # Existing track, update last seen time
-                                    tracks_dict[track_id] = current_time
+                            track_id = track.track_id
+                            active_tracks.add(track_id)
                             
-                            # Check for tracks that are no longer active
-                            for track_id in list(tracks_dict.keys()):
-                                if track_id not in active_tracks:
-                                    # Track is no longer visible
-                                    last_seen = tracks_dict[track_id]
-                                    time_since_last_seen = (current_time - last_seen).total_seconds()
-                                    
-                                    if time_since_last_seen > self.tracking_data[device_id]["cooldown_period"]:
-                                        # Remove track after cooldown period
-                                        del tracks_dict[track_id]
-                                        if camera_type == "exit":
-                                            self.tracking_data[device_id]["current_count"] -= 1
+                            if track_id not in tracks_dict:
+                                tracks_dict[track_id] = current_time
+                                if camera_type == "entry":
+                                    self.tracking_data[device_id]["current_count"] += 1
+                            else:
+                                tracks_dict[track_id] = current_time
+                        
+                        # Cleanup old tracks
+                        for track_id in list(tracks_dict.keys()):
+                            if track_id not in active_tracks:
+                                last_seen = tracks_dict[track_id]
+                                if (current_time - last_seen).total_seconds() > self.tracking_data[device_id]["cooldown_period"]:
+                                    del tracks_dict[track_id]
+                                    if camera_type == "exit":
+                                        self.tracking_data[device_id]["current_count"] -= 1
 
-                            # Create report if enough time has passed
-                            if (current_time - self.tracking_data[device_id]["last_report_time"]).total_seconds() >= 60:
-                                self._create_camera_report(device_id, db)
-                                self.tracking_data[device_id]["last_report_time"] = current_time
+                        # Create report
+                        if (current_time - self.tracking_data[device_id]["last_report_time"]).total_seconds() >= 60:
+                            self._create_camera_report(device_id, db)
+                            self.tracking_data[device_id]["last_report_time"] = current_time
 
-                except Exception as e:
-                    logger.error(f"Processing error for camera {camera.id}: {str(e)}")
-                finally:
-                    cap.release()
-                    time.sleep(1)
+                    time.sleep(0.1)
 
             except Exception as e:
-                logger.error(f"Connection error for camera {camera.id}: {str(e)}")
-                retry_count += 1
-                time.sleep(retry_delay)
+                logger.error(f"Error processing camera stream: {str(e)}")
+            finally:
+                if cap is not None:
+                    cap.release()
+                time.sleep(2)
+                reconnect_attempts += 1
 
-        if retry_count >= max_retries:
-            logger.error(f"Max retries ({max_retries}) reached for camera {camera.id}")
+        logger.warning(f"Stopped processing for camera {camera.id}")
 
     def _create_camera_report(self, device_id: int, db: Session):
         """Create a report for camera-based detection."""
         try:
             tracking_data = self.tracking_data[device_id]
-            
-            # Create new report
             report = models.Report(
                 device_id=device_id,
                 total_people=tracking_data["current_count"],
                 detection_method="camera_based"
             )
-            
             db.add(report)
             db.commit()
-            
-            logger.info(f"Created camera-based report for device {device_id}: "
-                       f"Total={tracking_data['current_count']}")
-
+            logger.info(f"Created camera-based report for device {device_id}: Total={tracking_data['current_count']}")
         except Exception as e:
             logger.error(f"Error creating camera report: {str(e)}")
             db.rollback()
@@ -330,15 +310,12 @@ class DetectionSystem:
         """Stop camera-based detection for a device."""
         try:
             if device_id in self.tracking_data:
-                # Stop the detection threads
                 self.tracking_data[device_id]["is_running"] = False
                 
-                # Wait for threads to finish
                 if device_id in self.detection_threads:
                     self.detection_threads[device_id]["entry"].join()
                     self.detection_threads[device_id]["exit"].join()
                     
-                    # Clean up
                     del self.detection_threads[device_id]
                     del self.tracking_data[device_id]
                 
