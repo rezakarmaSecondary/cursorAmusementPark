@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, confloat
-from typing import Optional, List, Tuple
+from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
 from enum import Enum
 
@@ -7,6 +7,11 @@ class DetectionMethod(str, Enum):
     device_trigger = "device_trigger"
     camera_based = "camera_based"
     both = "both"
+
+class CameraType(str, Enum):
+    entry = "entry"
+    exit = "exit"
+    monitoring = "monitoring"
 
 class BoundingBox(BaseModel):
     x1: confloat(ge=0.0, le=1.0)  # Left coordinate (0-1)
@@ -56,8 +61,11 @@ class CameraBase(BaseModel):
     device_id: int
     name: str
     rtsp_url: str
-    camera_type: str
-    bounding_box: BoundingBox
+    camera_type: CameraType
+    polygon_points: Optional[List[List[float]]] = None  # List of [x, y] points for polygon
+
+    class Config:
+        from_attributes = True
 
 class CameraCreate(CameraBase):
     pass
@@ -65,13 +73,14 @@ class CameraCreate(CameraBase):
 class CameraUpdate(BaseModel):
     name: Optional[str] = None
     rtsp_url: Optional[str] = None
-    camera_type: Optional[str] = None
-    bounding_box: Optional[BoundingBox] = None
-    is_active: Optional[bool] = None
+    camera_type: Optional[CameraType] = None
+    polygon_points: Optional[List[List[float]]] = None
+
+    class Config:
+        from_attributes = True
 
 class Camera(CameraBase):
     id: int
-    is_active: bool
     created_at: datetime
     updated_at: Optional[datetime] = None
 
@@ -79,22 +88,29 @@ class Camera(CameraBase):
         from_attributes = True
 
 class PersonDetectionBase(BaseModel):
+    device_id: int
     camera_id: int
     person_id: str
     confidence: float
-    bbox: str
-    is_counted: bool = False
+    x1: Optional[float] = None
+    y1: Optional[float] = None
+    x2: Optional[float] = None
+    y2: Optional[float] = None
+    is_entry: bool = False
+    is_exit: bool = False
+    status: str = "detected"
     last_seen: Optional[datetime] = None
+    is_counted: bool = False
 
 class PersonDetectionCreate(PersonDetectionBase):
     pass
 
 class PersonDetection(PersonDetectionBase):
     id: int
-    timestamp: datetime
+    detection_time: datetime
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 class DeviceReportBase(BaseModel):
     device_id: int
@@ -115,7 +131,11 @@ class DeviceReport(DeviceReportBase):
 
 class ReportBase(BaseModel):
     device_id: int
-    total_people: int
+    start_time: datetime
+    end_time: datetime
+    total_entered: int = 0
+    total_exited: int = 0
+    current_count: int = 0
     detection_method: str
 
 class ReportCreate(ReportBase):

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Float
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Float, JSON
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database import Base
@@ -19,25 +19,22 @@ class Device(Base):
 
     cameras = relationship("Camera", back_populates="device", cascade="all, delete-orphan")
     reports = relationship("Report", back_populates="device", cascade="all, delete-orphan")
+    person_detections = relationship("PersonDetection", back_populates="device")
 
 class Camera(Base):
     __tablename__ = "cameras"
 
     id = Column(Integer, primary_key=True, index=True)
-    device_id = Column(Integer, ForeignKey("devices.id"))
-    name = Column(String)
-    rtsp_url = Column(String)
-    camera_type = Column(String)  # "entry" or "exit"
-    bounding_box_x1 = Column(Float)  # Left coordinate (0-1)
-    bounding_box_y1 = Column(Float)  # Top coordinate (0-1)
-    bounding_box_x2 = Column(Float)  # Right coordinate (0-1)
-    bounding_box_y2 = Column(Float)  # Bottom coordinate (0-1)
-    is_active = Column(Boolean, default=True)
+    device_id = Column(Integer, ForeignKey("devices.id"), nullable=False)
+    name = Column(String, nullable=False)
+    rtsp_url = Column(String, nullable=False)
+    camera_type = Column(String, nullable=False)  # 'entry', 'exit', or 'monitoring'
+    polygon_points = Column(JSON, nullable=True)  # Store polygon points as JSON array
     created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, onupdate=datetime.utcnow)
 
     device = relationship("Device", back_populates="cameras")
-    detections = relationship("PersonDetection", back_populates="camera")
+    person_detections = relationship("PersonDetection", back_populates="camera")
 
     @property
     def bounding_box(self):
@@ -65,23 +62,37 @@ class PersonDetection(Base):
     __tablename__ = "person_detections"
 
     id = Column(Integer, primary_key=True, index=True)
-    camera_id = Column(Integer, ForeignKey("cameras.id"))
-    person_id = Column(String)  # DeepSORT tracking ID
-    confidence = Column(Float)
-    bbox = Column(String)  # JSON string of [x1, y1, x2, y2]
-    timestamp = Column(DateTime(timezone=True), server_default=func.now())
-    is_counted = Column(Boolean, default=False)
-    last_seen = Column(DateTime(timezone=True))
+    device_id = Column(Integer, ForeignKey("devices.id"), nullable=False)
+    camera_id = Column(Integer, ForeignKey("cameras.id"), nullable=False)
+    person_id = Column(String, nullable=False)  # Unique ID for each person from DeepSORT
+    detection_time = Column(DateTime, default=datetime.utcnow)
+    confidence = Column(Float, nullable=False)
+    x1 = Column(Float, nullable=True)  # Bounding box coordinates
+    y1 = Column(Float, nullable=True)
+    x2 = Column(Float, nullable=True)
+    y2 = Column(Float, nullable=True)
+    is_entry = Column(Boolean, default=False)
+    is_exit = Column(Boolean, default=False)
+    status = Column(String, default='detected')  # detected, tracked, counted, lost
+    last_seen = Column(DateTime, nullable=True)
+    is_counted = Column(Boolean, default=False)  # Whether this detection has been counted in reports
 
-    camera = relationship("Camera", back_populates="detections")
+    # Relationships
+    device = relationship("Device", back_populates="person_detections")
+    camera = relationship("Camera", back_populates="person_detections")
 
 class Report(Base):
     __tablename__ = "reports"
 
     id = Column(Integer, primary_key=True, index=True)
-    device_id = Column(Integer, ForeignKey("devices.id"))
-    total_people = Column(Integer)
-    detection_method = Column(String)
+    device_id = Column(Integer, ForeignKey("devices.id"), nullable=False)
+    start_time = Column(DateTime, nullable=False)
+    end_time = Column(DateTime, nullable=False)
+    total_entered = Column(Integer, default=0)
+    total_exited = Column(Integer, default=0)
+    current_count = Column(Integer, default=0)  # Current number of people in the area
+    detection_method = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+    # Relationships
     device = relationship("Device", back_populates="reports") 
